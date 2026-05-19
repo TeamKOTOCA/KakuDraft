@@ -3,9 +3,6 @@
  *  GitHub API (with Tree API optimization), sync, snapshots, diff
  * =================================================================== */
 
-const USSP_DEFAULT_NAMESPACE_ID = 1;
-const USSP_DEFAULT_PREFIX = 'kakudraft';
-
 // === Cloud Pieces (build / apply / migrate) ===
 function buildCloudPieces() {
     const chapterIndex = (state.chapters || []).map((ch, idx) => ({
@@ -20,8 +17,7 @@ function buildCloudPieces() {
             replaceRules: state.replaceRules, insertButtons: state.insertButtons, fontSize: state.fontSize, theme: state.theme,
             deviceName: state.deviceName, menuTab: state.menuTab, favoriteActionKeys: state.favoriteActionKeys, fontFamily: state.fontFamily,
             folders: state.folders, currentFolderId: state.currentFolderId, favoriteEditMode: state.favoriteEditMode, keepScreenOn: state.keepScreenOn,
-            aiProvider: state.aiProvider, aiModel: state.aiModel, aiTab: state.aiTab, aiFreeOnly: state.aiFreeOnly, aiUsage: state.aiUsage,
-            usspBaseUrl: state.usspBaseUrl
+            aiProvider: state.aiProvider, aiModel: state.aiModel, aiTab: state.aiTab, aiFreeOnly: state.aiFreeOnly, aiUsage: state.aiUsage
         },
         keys: { ghTokenEnc: state.ghTokenEnc, ghRepo: state.ghRepo, deviceName: state.deviceName, aiKeyEnc: state.aiKeyEnc, aiKeysEnc: state.aiKeysEnc },
         stories: { chapters: chapterIndex, currentIdx: state.currentIdx, writingSessions: state.writingSessions },
@@ -119,7 +115,8 @@ async function fetchTextFileFromGithub(headers, owner, repo, path) {
         const binary = atob(cleaned);
         const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
         return new TextDecoder().decode(bytes);
-    } catch {
+    } catch (err) {
+        console.warn(`[GitHub] テキスト復号失敗: ${path}`, err);
         return null;
     }
 }
@@ -129,39 +126,45 @@ async function applyRemoteTextBackups(headers, owner, repo, merged) {
     for (let i = 0; i < chapters.length; i++) {
         const ch = chapters[i];
         const chapterId = ch.id || `chapter_${i + 1}`;
-        const bodyText = await fetchTextFileFromGithub(headers, owner, repo, `話/${chapterId}/body.txt`);
-        if (bodyText !== null) ch.body = bodyText;
+        try {
+            const bodyText = await fetchTextFileFromGithub(headers, owner, repo, `話/${chapterId}/body.txt`);
+            if (bodyText !== null) ch.body = bodyText;
+        } catch (err) {
+            console.warn(`[GitHub] 本文復元失敗: ${chapterId}`, err);
+        }
 
         const memos = ch.memos || [];
         for (let m = 0; m < memos.length; m++) {
-            const memoText = await fetchTextFileFromGithub(headers, owner, repo, `話/${chapterId}/memo_${m + 1}.txt`);
-            if (memoText !== null) memos[m].content = memoText;
+            try {
+                const memoText = await fetchTextFileFromGithub(headers, owner, repo, `話/${chapterId}/memo_${m + 1}.txt`);
+                if (memoText !== null) memos[m].content = memoText;
+            } catch (err) {
+                console.warn(`[GitHub] メモ復元失敗: ${chapterId}#${m + 1}`, err);
+            }
         }
     }
 
     const globalMemos = merged.globalMemos || [];
     for (let i = 0; i < globalMemos.length; i++) {
-        const text = await fetchTextFileFromGithub(headers, owner, repo, `メモ/global_${i + 1}.txt`);
-        if (text !== null) globalMemos[i].content = text;
+        try {
+            const text = await fetchTextFileFromGithub(headers, owner, repo, `メモ/global_${i + 1}.txt`);
+            if (text !== null) globalMemos[i].content = text;
+        } catch (err) {
+            console.warn(`[GitHub] グローバルメモ復元失敗: ${i + 1}`, err);
+        }
     }
 
     for (const [folderId, bundle] of Object.entries(merged.folderMemos || {})) {
         const memos = bundle?.memos || [];
         for (let i = 0; i < memos.length; i++) {
-            const text = await fetchTextFileFromGithub(headers, owner, repo, `メモ/folder_${folderId}_${i + 1}.txt`);
-            if (text !== null) memos[i].content = text;
+            try {
+                const text = await fetchTextFileFromGithub(headers, owner, repo, `メモ/folder_${folderId}_${i + 1}.txt`);
+                if (text !== null) memos[i].content = text;
+            } catch (err) {
+                console.warn(`[GitHub] フォルダメモ復元失敗: ${folderId}#${i + 1}`, err);
+            }
         }
     }
-}
-
-async function putCloudPiece(headers, owner, repo, key, data, sha = '') {
-    const path = CLOUD_PATHS[key];
-    if (!path) return;
-    const body = { message: `sync ${key}`, content: toBase64FromText(JSON.stringify(data)) };
-    if (sha) body.sha = sha;
-    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-    const res = await requestJson(url, { method: 'PUT', headers, body: JSON.stringify(body) });
-    if (!res.res.ok) throw new Error(res.body?.message || `${key} upload failed`);
 }
 
 async function migrateLegacyCloudIfNeeded(headers, owner, repo, remote, remoteMeta) {
@@ -180,23 +183,46 @@ async function migrateLegacyCloudIfNeeded(headers, owner, repo, remote, remoteMe
     const pieces = convertLegacyRemoteToPieces(legacyData, legacyAiChat);
     Object.entries(pieces).forEach(([key, data]) => {
         remote[key] = data;
-        remoteMeta[key] = { sha: legacyRes.body.sha };
+        // レガシー由来データは個別SHAが存在しないため未設定扱いにする
+        remoteMeta[key] = { sha: '' };
     });
 }
 
-// === GitHub Tree API for efficient sync ===
-async function fetchRemoteTreeShas(headers, owner, repo) {
-    const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/main?recursive=1`;
-    const res = await requestJson(url, { headers });
-    if (!res.res.ok) return {};
-    
-    const shas = {};
-    (res.body?.tree || []).forEach(item => {
-        if (item.type === 'blob' && (item.path.startsWith('設定/') || item.path.startsWith('話/') || item.path.startsWith('メモ/') || item.path.startsWith('テキスト/'))) {
-            shas[item.path] = item.sha;
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseRateLimitResetMs(res) {
+    const reset = Number(res?.headers?.get?.('x-ratelimit-reset') || 0);
+    if (!reset) return 0;
+    return Math.max(0, (reset * 1000) - Date.now());
+}
+
+async function putGithubFileSafely(headers, owner, repo, path, message, contentBase64, knownSha = '') {
+    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+    let sha = knownSha || '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const body = { message, content: contentBase64 };
+        if (sha) body.sha = sha;
+        const putRes = await requestJson(url, { method: 'PUT', headers, body: JSON.stringify(body) });
+        if (putRes.res.ok) return putRes;
+
+        const status = putRes.res.status;
+        if (status === 409 || status === 422) {
+            const latest = await requestJson(url, { headers });
+            sha = latest.res.status === 200 ? (latest.body?.sha || '') : '';
+            await sleep(200 + (attempt * 200));
+            continue;
         }
-    });
-    return shas;
+        if (status === 403 || status === 429) {
+            const waitMs = Math.min(5000, Math.max(300, parseRateLimitResetMs(putRes.res) || (500 * (attempt + 1))));
+            await sleep(waitMs);
+            continue;
+        }
+        throw new Error(putRes.body?.message || `${path} upload failed (${status})`);
+    }
+    throw new Error(`${path} upload failed after retries`);
 }
 
 // === GitHub Sync (UP/DOWN) ===
@@ -257,14 +283,14 @@ async function githubSync(mode) {
                 const batchSize = 3;
                 for (let i = 0; i < changedPieces.length; i += batchSize) {
                     const batch = changedPieces.slice(i, i + batchSize);
-                    await Promise.all(batch.map(async (key) => {
+                    const batchResults = await Promise.allSettled(batch.map(async (key) => {
                         const contentJson = JSON.stringify(pieces[key]);
-                        const putBody = { message: `sync ${key}`, content: toBase64FromText(contentJson) };
-                        if (remoteMeta[key]?.sha) putBody.sha = remoteMeta[key].sha;
-                        const url = `https://api.github.com/repos/${owner}/${repo}/contents/${CLOUD_PATHS[key]}`;
-                        const putRes = await requestJson(url, { method:'PUT', headers, body: JSON.stringify(putBody) });
-                        if (!putRes.res.ok) throw new Error(putRes.body?.message || `${key}のアップロード失敗`);
+                        await putGithubFileSafely(headers, owner, repo, CLOUD_PATHS[key], `sync ${key}`, toBase64FromText(contentJson), remoteMeta[key]?.sha || '');
                     }));
+                    const failedPieces = batchResults
+                        .map((r, idx) => r.status === 'rejected' ? `${batch[idx]}: ${r.reason?.message || r.reason}` : null)
+                        .filter(Boolean);
+                    if (failedPieces.length) console.warn('[GitHub] 一部ピースのアップロード失敗', failedPieces);
                     step += batch.length;
                     showProgressToast('UP: ピースをアップロード中...', step, totalSteps);
                 }
@@ -275,8 +301,7 @@ async function githubSync(mode) {
             state.syncMeta = meta;
             const metaBody = { message: 'sync metadata', content: toBase64FromText(JSON.stringify(meta)) };
             if (remoteMeta.metadata?.sha) metaBody.sha = remoteMeta.metadata.sha;
-            const metaUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${CLOUD_PATHS.metadata}`;
-            await requestJson(metaUrl, { method:'PUT', headers, body: JSON.stringify(metaBody) });
+            await putGithubFileSafely(headers, owner, repo, CLOUD_PATHS.metadata, 'sync metadata', toBase64FromText(JSON.stringify(meta)), remoteMeta.metadata?.sha || '');
 
             // Text backups with SHA-based skip
             showProgressToast('UP: テキストバックアップ中...', step, totalSteps);
@@ -302,19 +327,24 @@ async function githubSync(mode) {
                 try {
                     const remoteText = new TextDecoder().decode(Uint8Array.from(atob(existing.remoteContent.replace(/\n/g, '')), c => c.charCodeAt(0)));
                     return remoteText !== text;
-                } catch { return true; }
+                } catch (err) {
+                    console.warn(`[GitHub] リモートテキスト比較失敗: ${path}`, err);
+                    return true;
+                }
             });
 
             if (changedTxtFiles.length > 0) {
-                const batchSize = 5;
+                const batchSize = 3;
                 for (let i = 0; i < changedTxtFiles.length; i += batchSize) {
                     const batch = changedTxtFiles.slice(i, i + batchSize);
-                    await Promise.all(batch.map(async ([path, text]) => {
-                        const fileUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-                        const txtBody = { message: `txt backup ${path}`, content: toBase64FromText(text) };
-                        if (shaMap[path]?.sha) txtBody.sha = shaMap[path].sha;
-                        await requestJson(fileUrl, { method:'PUT', headers, body: JSON.stringify(txtBody) });
+                    const uploadResults = await Promise.allSettled(batch.map(async ([path, text]) => {
+                        await putGithubFileSafely(headers, owner, repo, path, `txt backup ${path}`, toBase64FromText(text), shaMap[path]?.sha || '');
                     }));
+                    const failedTxt = uploadResults
+                        .map((r, idx) => r.status === 'rejected' ? `${batch[idx][0]}: ${r.reason?.message || r.reason}` : null)
+                        .filter(Boolean);
+                    if (failedTxt.length) console.warn('[GitHub] テキストアップロード一部失敗', failedTxt);
+                    await new Promise(r => setTimeout(r, 350));
                 }
             }
             step++;
@@ -352,127 +382,17 @@ async function githubSync(mode) {
 }
 
 
-function getUSSP() {
-    const sdk = window.USSP || window.ussp || null;
-    if (!sdk) throw new Error('USSP SDK が読み込まれていません');
-    return sdk;
-}
-
-function getUSSPRedirectUri() {
-    return `${window.location.origin}/callback/index.html`;
-}
-
-async function initUSSPFromState() {
-    const sdk = getUSSP();
-    const baseUrl = state.usspBaseUrl || document.getElementById('ussp-base-url')?.value?.trim();
-    if (!baseUrl) throw new Error('USSP設定（Base URL）を入力してください');
-
-    const clientId = `kakudraft-${window.location.host || 'web'}`;
-    const redirectUri = getUSSPRedirectUri();
-    sdk.config.url(baseUrl);
-    await sdk.init({ clientId, redirectUri });
-    return sdk;
-}
-
-function getUSSPPath(path) {
-    const prefix = USSP_DEFAULT_PREFIX;
-    const normalized = (path || '').replace(/^\/+/, '');
-    return `${prefix}/${normalized}`;
-}
-
-async function usspLogin() {
-    try {
-        const baseUrl = state.usspBaseUrl || document.getElementById('ussp-base-url')?.value?.trim();
-        if (!baseUrl) throw new Error('USSP設定（Base URL）を入力してください');
-        sessionStorage.setItem('kakudraft-ussp-base-url', baseUrl);
-        const sdk = await initUSSPFromState();
-        sdk.auth.login();
-    } catch (err) {
-        showToast(`USSPログインエラー: ${err.message}`, 'error');
-    }
-}
-
-async function usspSync(mode) {
-    save();
-    try {
-        const sdk = await initUSSPFromState();
-        const namespaceId = USSP_DEFAULT_NAMESPACE_ID;
-        if (!sdk.auth.isAuthenticated()) throw new Error('USSPログインが必要です');
-
-        if (mode === 'up') {
-            const pieces = buildCloudPieces();
-            const files = {
-                [CLOUD_PATHS.settings]: JSON.stringify(pieces.settings),
-                [CLOUD_PATHS.keys]: JSON.stringify(pieces.keys),
-                [CLOUD_PATHS.stories]: JSON.stringify(pieces.stories),
-                [CLOUD_PATHS.memos]: JSON.stringify(pieces.memos),
-                [CLOUD_PATHS.aiChat]: JSON.stringify(pieces.aiChat),
-                [CLOUD_PATHS.metadata]: JSON.stringify({ updatedAt: Date.now(), files: Object.keys(CLOUD_PATHS) }),
-                [CLOUD_PATHS.assetsIndex]: JSON.stringify(pieces.assetsIndex),
-                ...buildTextBackupFiles()
-            };
-            const entries = Object.entries(files);
-            for (let i = 0; i < entries.length; i++) {
-                const [path, content] = entries[i];
-                showProgressToast('USSP UP: アップロード中...', i + 1, entries.length);
-                await sdk.files.upload({
-                    namespaceId,
-                    path: getUSSPPath(path),
-                    file: new Blob([content], { type: 'text/plain;charset=utf-8' })
-                });
-            }
-            hideProgressToast();
-            showToast(`USSP UP完了 (${entries.length}ファイル)`, 'success');
-            return;
-        }
-
-        const baseKeys = ['settings', 'keys', 'stories', 'memos', 'aiChat', 'assetsIndex'];
-        const remote = {};
-        for (const key of baseKeys) {
-            try {
-                const blob = await sdk.files.download({ namespaceId, path: getUSSPPath(CLOUD_PATHS[key]) });
-                remote[key] = JSON.parse(await blob.text());
-            } catch { }
-        }
-        if (!remote.settings && !remote.stories && !remote.memos) throw new Error('USSP側に復元データが見つかりません');
-        applyCloudPieces(remote, { preserveLocalSecrets: true, preserveLocalUiPrefs: false, preserveLocalDeviceName: true });
-
-        const merged = structuredClone(state);
-        await (async () => {
-            const chapters = merged.chapters || [];
-            for (let i = 0; i < chapters.length; i++) {
-                const ch = chapters[i];
-                const chapterId = ch.id || `chapter_${i + 1}`;
-                try {
-                    const bodyBlob = await sdk.files.download({ namespaceId, path: getUSSPPath(`話/${chapterId}/body.txt`) });
-                    ch.body = await bodyBlob.text();
-                } catch { }
-                for (let m = 0; m < (ch.memos || []).length; m++) {
-                    try {
-                        const memoBlob = await sdk.files.download({ namespaceId, path: getUSSPPath(`話/${chapterId}/memo_${m + 1}.txt`) });
-                        ch.memos[m].content = await memoBlob.text();
-                    } catch { }
-                }
-            }
-        })();
-
-        state = normalizeStateShape(merged);
-        await persistNow();
-        refreshUI();
-        loadChapter(state.currentIdx);
-        showToast('USSP DOWN完了', 'success');
-    } catch (err) {
-        hideProgressToast();
-        showToast(`USSP同期エラー: ${err.message}`, 'error');
-    }
-}
 
 // === Snapshots on GitHub ===
 async function uploadRepoSnapshot(headers, owner, repo, currentState, reason) {
-    const snapshotPath = `kakudraft_snapshots/${new Date().toISOString().replace(/[:.]/g, '-')}_${sanitizeFileName(state.deviceName || 'device')}_${reason}.json`;
-    const content = toBase64FromText(JSON.stringify(currentState));
-    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${snapshotPath}`;
-    await fetch(apiUrl, { method: 'PUT', headers, body: JSON.stringify({ message: `snapshot: ${reason}`, content }) });
+    try {
+        const snapshotPath = `kakudraft_snapshots/${new Date().toISOString().replace(/[:.]/g, '-')}_${sanitizeFileName(state.deviceName || 'device')}_${reason}.json`;
+        const content = toBase64FromText(JSON.stringify(currentState));
+await putGithubFileSafely(headers, owner, repo, snapshotPath, `snapshot: ${reason}`, content, '');
+    } catch (err) {
+        console.error('[GitHub] Snapshot upload failed', err);
+        showToast('スナップショット保存に失敗しました', 'error');
+    }
 }
 
 async function fetchGithubSnapshots() {
@@ -593,7 +513,7 @@ async function checkRemoteDiffOnStartup(token) {
     if (remoteTs <= localTs) return;
 
     // Fetch remote pieces to compare per-piece
-    const piecesToCheck = ['settings', 'stories', 'memos', 'aiChat'];
+    const piecesToCheck = ['settings', 'stories', 'memos', 'aiChat', 'assetsIndex'];
     const results = await Promise.all(piecesToCheck.map(async (key) => {
         const path = CLOUD_PATHS[key];
         const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
@@ -611,7 +531,7 @@ async function checkRemoteDiffOnStartup(token) {
     if (!changedPieces.length) return;
 
     showDiffDialog(
-        changedPieces.map(k => k === 'settings' ? '設定' : k === 'stories' ? '話(索引)' : k === 'memos' ? 'メモ' : 'AIチャット'),
+        changedPieces.map(k => k === 'settings' ? '設定' : k === 'stories' ? '話(索引)' : k === 'memos' ? 'メモ' : k === 'assetsIndex' ? '添付ファイル索引' : 'AIチャット'),
         changedPieces,
         async (selectedKeys) => {
             showProgressToast('リモートから差分を取得中...', 0, selectedKeys.length);
@@ -676,6 +596,35 @@ window.confirmDiffSelection = function(keys) {
 
 // === Attachment sync to GitHub ===
 async function syncAttachmentsToGithub(headers, owner, repo) {
-    // Placeholder - can be extended for attachment upload
-    return;
+    const items = Array.isArray(state.assetsIndex?.items) ? state.assetsIndex.items : [];
+    if (!items.length) return;
+
+    const batchSize = 3;
+    for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        const results = await Promise.allSettled(batch.map(async (item) => {
+            if (!item?.id) return;
+            const attachment = await getAttachmentData(item.id);
+            const rawData = attachment?.data ?? (typeof attachment === 'string' ? attachment : null);
+            if (!rawData) throw new Error(`${item.id}: データ未検出`);
+            const b64 = typeof rawData === 'string' ? rawData.split(',').pop() : null;
+            if (!b64) throw new Error(`${item.id}: Base64変換失敗`);
+
+            const path = `添付/${item.id}_${sanitizeFileName(item.name || 'attachment.bin')}`;
+            const fileUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+            const latest = await requestJson(fileUrl, { headers });
+            const latestSha = latest.res.status === 200 ? (latest.body?.sha || '') : '';
+
+            // 既存ファイルと同一ならスキップ（API呼び出し削減）
+            if (latest.res.status === 200 && latest.body?.content) {
+                const remoteB64 = String(latest.body.content || '').replace(/\n/g, '');
+                if (remoteB64 === b64) return;
+            }
+
+            await putGithubFileSafely(headers, owner, repo, path, `attachment backup ${item.id}`, b64, latestSha);
+        }));
+        const failed = results.map((r, idx) => r.status === 'rejected' ? `${batch[idx]?.id}: ${r.reason?.message || r.reason}` : null).filter(Boolean);
+        if (failed.length) console.warn('[GitHub] 添付ファイル一部同期失敗', failed);
+        await sleep(700);
+    }
 }
