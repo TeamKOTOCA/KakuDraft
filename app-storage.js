@@ -142,8 +142,13 @@ async function autoSaveAsync() {
             // Save snapshot before auto-sync
             const { owner, repo } = parsedRepo;
             await uploadRepoSnapshot(headers, owner, repo, getStateWithoutAIChat(), 'auto-save');
-        } catch { }
-    } catch { }
+        } catch (err) {
+            console.error('[AutoSave] GitHub snapshot failed', err);
+            showToast('自動保存のGitHubバックアップに失敗しました', 'error');
+        }
+    } catch (err) {
+        console.error('[AutoSave] Unexpected error', err);
+    }
 }
 
 // === Attachment Storage ===
